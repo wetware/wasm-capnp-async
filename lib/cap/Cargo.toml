@@ -1,0 +1,12 @@
+[package]
+name = "cap"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+capnp = "0.21.5"
+capnp-rpc = "0.21.0"
+capnpc = "0.21.4"
+
+[build-dependencies]
+capnpc = "0.21.4"
