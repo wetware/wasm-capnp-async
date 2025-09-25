@@ -1,0 +1,15 @@
+[package]
+name = "wasm-capnp-async"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = ["lib/cap"]
+
+[dependencies]
+cap = { path = "lib/cap" }
+capnp = "0.21.5"
+wasmer = "6.0.1"
+wasmer-wasi = "3.1.1"
+wasmer-wasix = "0.600.1"
+socket2 = { version = "0.5.3", features = [ "all" ] }
