@@ -1,54 +1,56 @@
 use std::str;
 
-use capnp;
+use capnp::capability::Promise;
 use capnp_rpc::{pry, rpc_twoparty_capnp, twoparty, RpcSystem};
 
 capnp::generated_code!(pub mod echo_capnp);
+
+use echo_capnp::{echoer, echoer_provider};
 
 struct Echoer;
 
 impl echo_capnp::echoer::Server for Echoer {
     fn echo(
         &mut self,
-        params: echo_capnp::echoer::EchoParams,
-        mut results: echo_capnp::echoer::EchoResults,
-    ) -> capnp::capability::Promise<(), capnp::Error> {
+        params: echoer::EchoParams,
+        mut results: echoer::EchoResults,
+    ) -> Promise<(), capnp::Error> {
         let msg = pry!(pry!(params.get()).get_msg());
         results.get().set_reply(msg.as_bytes());
-        capnp::capability::Promise::ok(())
+        Promise::ok(())
     }
 }
 
 struct EchoerProvider {
-    echoers: Vec<echo_capnp::echoer::Client>,
+    echoers: Vec<echoer::Client>,
 }
 
 impl EchoerProvider {
     fn new() -> Self {
-        let mut echoers: Vec<echo_capnp::echoer::Client> = vec![];
+        let mut echoers: Vec<echoer::Client> = vec![];
         for _ in 0..10 {
-            let echoer: echo_capnp::echoer::Client = capnp_rpc::new_client(Echoer {});
+            let echoer: echoer::Client = capnp_rpc::new_client(Echoer {});
             echoers.push(echoer);
         }
         Self { echoers: echoers }
     }
 
-    fn client(/* TODO pass pipe */) -> echo_capnp::echoer_provider::Client {
-        let provider: echo_capnp::echoer_provider::Client =
+    fn client(/* TODO pass pipe */) -> echoer_provider::Client {
+        let provider: echoer_provider::Client =
             capnp_rpc::new_client(EchoerProvider::new());
         provider
     }
 }
 
-impl echo_capnp::echoer_provider::Server for EchoerProvider {
+impl echoer_provider::Server for EchoerProvider {
     fn echoer(
         &mut self,
-        _params: echo_capnp::echoer_provider::EchoerParams,
-        mut results: echo_capnp::echoer_provider::EchoerResults,
-    ) -> capnp::capability::Promise<(), capnp::Error> {
-        let echoer: echo_capnp::echoer::Client = capnp_rpc::new_client(Echoer {});
+        _params: echoer_provider::EchoerParams,
+        mut results: echoer_provider::EchoerResults,
+    ) -> Promise<(), capnp::Error> {
+        let echoer: echoer::Client = capnp_rpc::new_client(Echoer {});
         results.get().set_echoer(echoer);
-        capnp::capability::Promise::ok(())
+        Promise::ok(())
     }
 }
 
