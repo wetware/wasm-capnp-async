@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["lib/cap"]
+members = [ "lib/cap" ]
+exclude = [ "wasm" ]
 
 [dependencies]
 cap = { path = "lib/cap" }
@@ -13,3 +14,7 @@ wasmer = "6.0.1"
 wasmer-wasi = "3.1.1"
 wasmer-wasix = "0.600.1"
 socket2 = { version = "0.5.3", features = [ "all" ] }
+capnp-rpc = "0.21.0"
+tokio = { version = "1.47.1", features = ["full"] }
+tokio-util = { version = "0.7.16", features = ["compat"] }
+wasip1 = "1.0.0"
