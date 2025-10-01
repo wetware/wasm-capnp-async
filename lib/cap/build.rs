@@ -6,4 +6,4 @@ fn main() {
         .file("echo.capnp")
         .run()
         .expect("schema compiler command");
-    }
+}

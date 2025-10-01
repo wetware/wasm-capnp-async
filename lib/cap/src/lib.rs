@@ -1,13 +1,11 @@
-use std::str;
-
 use capnp::capability::Promise;
-use capnp_rpc::{pry, rpc_twoparty_capnp, twoparty, RpcSystem};
+use capnp_rpc::{RpcSystem, pry, rpc_twoparty_capnp, twoparty};
 
 capnp::generated_code!(pub mod echo_capnp);
 
 use echo_capnp::{echoer, echoer_provider};
 
-struct Echoer;
+pub struct Echoer;
 
 impl echo_capnp::echoer::Server for Echoer {
     fn echo(
@@ -21,12 +19,12 @@ impl echo_capnp::echoer::Server for Echoer {
     }
 }
 
-struct EchoerProvider {
+pub struct EchoerProvider {
     echoers: Vec<echoer::Client>,
 }
 
 impl EchoerProvider {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let mut echoers: Vec<echoer::Client> = vec![];
         for _ in 0..10 {
             let echoer: echoer::Client = capnp_rpc::new_client(Echoer {});
@@ -35,9 +33,8 @@ impl EchoerProvider {
         Self { echoers: echoers }
     }
 
-    fn client(/* TODO pass pipe */) -> echoer_provider::Client {
-        let provider: echoer_provider::Client =
-            capnp_rpc::new_client(EchoerProvider::new());
+    pub fn client() -> echoer_provider::Client {
+        let provider: echoer_provider::Client = capnp_rpc::new_client(EchoerProvider::new());
         provider
     }
 }
@@ -53,4 +50,3 @@ impl echoer_provider::Server for EchoerProvider {
         Promise::ok(())
     }
 }
-
