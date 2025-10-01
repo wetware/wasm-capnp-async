@@ -13,6 +13,8 @@ use wasip1::{
     fd_fdstat_set_flags,
 };
 
+capnp::generated_code!(pub mod echo_capnp);
+
 fn eventtype_tag(t: wasip1::Eventtype) -> u8 {
     if t == wasip1::EVENTTYPE_CLOCK
         || t == wasip1::EVENTTYPE_FD_READ
