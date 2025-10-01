@@ -225,4 +225,42 @@ impl futures::io::AsyncWrite for NonBlockingStdout {
         self.poll_flush(cx)
     }
 }
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    set_nonblocking(FD_STDIN)?;
+    set_nonblocking(FD_STDOUT)?;
+
+    let stdin = BufReader::new(NonBlockingStdin::new());
+    let stdout = BufWriter::new(NonBlockingStdout::new());
+
+    // use the same capnp RPC setup as before but using stdin/stdout as the transport:
+    let network = twoparty::VatNetwork::new(
+        stdin,
+        stdout,
+        rpc_twoparty_capnp::Side::Client,
+        Default::default(),
+    );
+
+    let mut rpc_system = RpcSystem::new(Box::new(network), None);
+
+    let echoer_provider: echo_capnp::echoer_provider::Client =
+        rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
+
+    tokio::task::spawn_local(rpc_system);
+
+    {
+        let echoer_request = echoer_provider.echoer_request();
+        let resp = echoer_request.send().promise.await?;
+        let echoer = resp.get()?.get_echoer()?;
+        {
+            let mut echo_request = echoer.echo_request();
+            echo_request.get().set_msg("Hello from WASI!");
+            let echo_response = echo_request.send().promise.await?;
+            let reply = echo_response.get()?.get_reply()?;
+            println!("Received reply: {}", std::str::from_utf8(reply)?);
+        }
+    }
+
+    Ok(())
 }
