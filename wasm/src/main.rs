@@ -23,6 +23,21 @@ fn eventtype_tag(t: wasip1::Eventtype) -> u8 {
         255
     }
 }
+
+fn set_nonblocking(fd: Fd) -> io::Result<()> {
+    let err: Errno = unsafe {
+        // let mut flags = wasip1::fd_fdstat_get(fd)?.flags;
+        let mut flags = fd_fdstat_get(fd).unwrap().fs_flags;
+        flags |= FDFLAGS_NONBLOCK;
+        fd_fdstat_set_flags(fd, flags).unwrap();
+        ERRNO_SUCCESS
+    };
+    match err {
+        ERRNO_SUCCESS => Ok(()),
+        _ => Err(io::Error::new(io::ErrorKind::Other, err)),
+    }
+}
+
 struct NonBlockingStdin {
     inner: std::io::Stdin,
     waker: Arc<Mutex<Option<Waker>>>,
