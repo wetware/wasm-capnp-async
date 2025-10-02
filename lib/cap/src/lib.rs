@@ -1,5 +1,6 @@
 use capnp::capability::Promise;
-use capnp_rpc::{RpcSystem, pry, rpc_twoparty_capnp, twoparty};
+use capnp_rpc::pry;
+use tracing::debug;
 
 capnp::generated_code!(pub mod echo_capnp);
 
@@ -13,13 +14,19 @@ impl echo_capnp::echoer::Server for Echoer {
         params: echoer::EchoParams,
         mut results: echoer::EchoResults,
     ) -> Promise<(), capnp::Error> {
+        debug!("Received echo request");
         let msg = pry!(pry!(params.get()).get_msg());
-        results.get().set_reply(msg.as_bytes());
+        let msg_bytes = msg.as_bytes();
+        let msg_str = std::str::from_utf8(msg_bytes);
+        debug!(?msg_str, "Echoing message");
+        results.get().set_reply(msg_bytes);
+        debug!("Ended echo request");
         Promise::ok(())
     }
 }
 
 pub struct EchoerProvider {
+    i: usize,
     echoers: Vec<echoer::Client>,
 }
 
@@ -30,7 +37,10 @@ impl EchoerProvider {
             let echoer: echoer::Client = capnp_rpc::new_client(Echoer {});
             echoers.push(echoer);
         }
-        Self { echoers: echoers }
+        Self {
+            i: 0,
+            echoers: echoers,
+        }
     }
 
     pub fn client() -> echoer_provider::Client {
@@ -42,11 +52,19 @@ impl EchoerProvider {
 impl echoer_provider::Server for EchoerProvider {
     fn echoer(
         &mut self,
-        _params: echoer_provider::EchoerParams,
+    _params: echoer_provider::EchoerParams,
         mut results: echoer_provider::EchoerResults,
     ) -> Promise<(), capnp::Error> {
-        let echoer: echoer::Client = capnp_rpc::new_client(Echoer {});
-        results.get().set_echoer(echoer);
+    debug!("Received echoer request");
+        
+        // Round-robin selection of an Echoer client without risking out-of-bounds.
+        // Use modulo over the number of echoers, then bump the counter.
+        let len = self.echoers.len();
+        let idx = self.i % len;
+        let ec = self.echoers[idx].clone();
+        self.i = self.i.wrapping_add(1);
+        results.get().set_echoer(ec);
+        debug!("Ended echoer request");
         Promise::ok(())
     }
 }

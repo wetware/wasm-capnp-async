@@ -10,7 +10,6 @@ exclude = [ "wasm" ]
 [dependencies]
 cap = { path = "lib/cap" }
 capnp = "0.21.5"
-wasmer = "6.0.1"
 wasmer-wasi = "3.1.1"
 wasmer-wasix = "0.600.1"
 socket2 = { version = "0.5.3", features = [ "all" ] }
@@ -18,3 +17,7 @@ capnp-rpc = "0.21.0"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-util = { version = "0.7.16", features = ["compat"] }
 wasip1 = "1.0.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+wasmtime = "37.0.1"
+wasmtime-wasi = "37.0.1"

@@ -6,15 +6,8 @@ edition = "2024"
 [dependencies]
 capnp = "0.21.5"
 capnp-rpc = "0.21.0"
-capnpc = "0.21.4"
 futures = "0.3"
-futures-util = "0.3"
-tokio = { version = "1.47.1", features = ["io-util", "macros", "rt", "time"] }
-tokio-util = { version = "0.7.16", features = ["compat"] }
-wasip1 = "1.0.0"
-
-[build]
-target = "wasm32-wasip1"
+wasip2 = "1.0.1"
 
 [build-dependencies]
 capnpc = "0.21.4"

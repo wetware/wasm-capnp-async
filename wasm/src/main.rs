@@ -1,240 +1,114 @@
-use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
-use futures::io::{BufReader, BufWriter};
+use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use std::io;
-use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
-use std::time::Duration;
-use tokio;
-use tokio::task;
-use tokio::time;
-use wasip1::{
-    ERRNO_SUCCESS, Errno, FD_STDIN, FD_STDOUT, FDFLAGS_NONBLOCK, Fd, fd_fdstat_get,
-    fd_fdstat_set_flags,
-};
+use std::task::{Context, Poll};
 
+use futures::executor::LocalPool;
+use futures::{pin_mut, future::{select, Either}};
+
+use wasip2::cli::{stdin, stdout, stderr};
+use wasip2::io::streams;
+
+// Keep the generated Cap’n Proto bindings.
 capnp::generated_code!(pub mod echo_capnp);
 
-fn eventtype_tag(t: wasip1::Eventtype) -> u8 {
-    if t == wasip1::EVENTTYPE_CLOCK
-        || t == wasip1::EVENTTYPE_FD_READ
-        || t == wasip1::EVENTTYPE_FD_WRITE
-    {
-        return t.raw();
-    } else {
-        255
-    }
+// Simple adapters over wasi:io/streams. We implement non-blocking reads (return
+// Pending when no bytes are ready) and flush-safe writes so Cap'n Proto frames
+// aren't truncated.
+
+struct Wasip2Stdin {
+    stream: streams::InputStream,
 }
 
-fn set_nonblocking(fd: Fd) -> io::Result<()> {
-    let err: Errno = unsafe {
-        // let mut flags = wasip1::fd_fdstat_get(fd)?.flags;
-        let mut flags = fd_fdstat_get(fd).unwrap().fs_flags;
-        flags |= FDFLAGS_NONBLOCK;
-        fd_fdstat_set_flags(fd, flags).unwrap();
-        ERRNO_SUCCESS
-    };
-    match err {
-        ERRNO_SUCCESS => Ok(()),
-        _ => Err(io::Error::new(io::ErrorKind::Other, err)),
-    }
+impl Wasip2Stdin {
+    fn new(stream: streams::InputStream) -> Self { Self { stream } }
 }
 
-struct NonBlockingStdin {
-    inner: std::io::Stdin,
-    waker: Arc<Mutex<Option<Waker>>>,
-}
-
-impl NonBlockingStdin {
-    fn new() -> Self {
-        Self {
-            inner: std::io::stdin(),
-            waker: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    fn schedule_read_wake(waker: Arc<Mutex<Option<Waker>>>) {
-        task::spawn(async move {
-            loop {
-                // Non-blocking readiness check using WASI poll_oneoff with zero-time clock.
-                let ready = unsafe {
-                    // Build FD_READ and zero-time CLOCK subscriptions.
-                    let mut sub_fd: wasip1::Subscription = std::mem::zeroed();
-                    sub_fd.userdata = 1;
-                    sub_fd.u.tag = eventtype_tag(wasip1::EVENTTYPE_FD_READ);
-                    sub_fd.u.u.fd_read = wasip1::SubscriptionFdReadwrite {
-                        file_descriptor: FD_STDIN,
-                    };
-
-                    let mut sub_clk: wasip1::Subscription = std::mem::zeroed();
-                    sub_clk.userdata = 2;
-                    sub_clk.u.tag = eventtype_tag(wasip1::EVENTTYPE_CLOCK);
-                    sub_clk.u.u.clock = wasip1::SubscriptionClock {
-                        id: wasip1::CLOCKID_MONOTONIC,
-                        timeout: 0,
-                        precision: 0,
-                        flags: 0,
-                    };
-
-                    let subs = [sub_fd, sub_clk];
-                    let mut evs: [wasip1::Event; 2] = std::mem::zeroed();
-                    let n = match wasip1::poll_oneoff(subs.as_ptr(), evs.as_mut_ptr(), subs.len()) {
-                        Ok(n) => n,
-                        Err(_) => 0,
-                    };
-
-                    // Ready if any FD_READ event succeeded.
-                    (0..n).any(|i| {
-                        evs[i].type_ == wasip1::EVENTTYPE_FD_READ
-                            && evs[i].error == wasip1::ERRNO_SUCCESS
-                    })
-                };
-
-                if ready {
-                    if let Some(w) = waker.lock().unwrap().clone() {
-                        w.wake();
-                    }
-                    break;
-                } else {
-                    time::sleep(Duration::from_millis(1)).await;
-                }
-            }
-        });
-    }
-}
-
-impl futures::io::AsyncRead for NonBlockingStdin {
+impl futures::io::AsyncRead for Wasip2Stdin {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        match this.inner.read(buf) {
-            Ok(n) => Poll::Ready(Ok(n)),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                {
-                    let mut guard = this.waker.lock().unwrap();
-                    *guard = Some(cx.waker().clone());
+        // Non-blocking read: try to read available bytes; if none, yield Pending and self-wake.
+        let len = buf.len() as u64;
+        match self.stream.read(len) {
+            Ok(bytes) => {
+                let n = bytes.len();
+                if n == 0 {
+                    // No data ready yet; yield and try again later.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 }
-                Self::schedule_read_wake(this.waker.clone());
-                Poll::Pending
+                buf[..n].copy_from_slice(&bytes);
+                Poll::Ready(Ok(n))
             }
-            Err(e) => Poll::Ready(Err(e)),
+            Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}")))),
         }
     }
 }
 
-struct NonBlockingStdout {
-    inner: std::io::Stdout,
-    waker: Arc<Mutex<Option<Waker>>>,
+struct Wasip2Stdout {
+    stream: streams::OutputStream,
 }
 
-impl NonBlockingStdout {
-    fn new() -> Self {
-        Self {
-            inner: std::io::stdout(),
-            waker: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    fn schedule_write_wake(waker: Arc<Mutex<Option<Waker>>>) {
-        task::spawn(async move {
-            loop {
-                // Non-blocking readiness check using WASI poll_oneoff with zero-time clock.
-                let ready = unsafe {
-                    // Build FD_WRITE and zero-time CLOCK subscriptions.
-                    let mut sub_fd: wasip1::Subscription = std::mem::zeroed();
-                    sub_fd.userdata = 1;
-                    sub_fd.u.tag = eventtype_tag(wasip1::EVENTTYPE_FD_WRITE);
-                    sub_fd.u.u.fd_write = wasip1::SubscriptionFdReadwrite {
-                        file_descriptor: FD_STDOUT,
-                    };
-
-                    let mut sub_clk: wasip1::Subscription = std::mem::zeroed();
-                    sub_clk.userdata = 2;
-                    sub_clk.u.tag = eventtype_tag(wasip1::EVENTTYPE_CLOCK);
-                    sub_clk.u.u.clock = wasip1::SubscriptionClock {
-                        id: wasip1::CLOCKID_MONOTONIC,
-                        timeout: 0,
-                        precision: 0,
-                        flags: 0,
-                    };
-
-                    let subs = [sub_fd, sub_clk];
-                    let mut evs: [wasip1::Event; 2] = std::mem::zeroed();
-                    let n = match wasip1::poll_oneoff(subs.as_ptr(), evs.as_mut_ptr(), subs.len()) {
-                        Ok(n) => n,
-                        Err(_) => 0,
-                    };
-
-                    // Ready if any FD_WRITE event succeeded.
-                    (0..n).any(|i| {
-                        evs[i].type_ == wasip1::EVENTTYPE_FD_WRITE
-                            && evs[i].error == wasip1::ERRNO_SUCCESS
-                    })
-                };
-
-                if ready {
-                    if let Some(w) = waker.lock().unwrap().clone() {
-                        w.wake();
-                    }
-                    break;
-                } else {
-                    time::sleep(Duration::from_millis(1)).await;
-                }
-            }
-        });
+impl Wasip2Stdout {
+    fn new(stream: streams::OutputStream) -> Self {
+        Self { stream }
     }
 }
 
-impl futures::io::AsyncWrite for NonBlockingStdout {
+impl futures::io::AsyncWrite for Wasip2Stdout {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        match this.inner.write(buf) {
-            Ok(n) => Poll::Ready(Ok(n)),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                {
-                    let mut guard = this.waker.lock().unwrap();
-                    *guard = Some(cx.waker().clone());
-                }
-                Self::schedule_write_wake(this.waker.clone());
-                Poll::Pending
-            }
-            Err(e) => Poll::Ready(Err(e)),
+        // Ensure we don't misreport partial writes: use blocking_write_and_flush so the
+        // entire buffer is committed before returning. This avoids frame truncation that can
+        // deadlock Cap'n Proto RPC on subsequent reads.
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        match self.stream.blocking_write_and_flush(buf) {
+            Ok(()) => Poll::Ready(Ok(buf.len())),
+            Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}")))),
         }
     }
 
     fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        match this.inner.flush() {
+        // Ensure any pending output is committed before proceeding.
+        match self.stream.blocking_flush() {
             Ok(()) => Poll::Ready(Ok(())),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                Self::schedule_write_wake(this.waker.clone());
-                Poll::Pending
-            }
-            Err(e) => Poll::Ready(Err(e)),
+            Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}")))),
         }
     }
 
-    fn poll_close(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_flush(cx)
+    fn poll_close(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Ensure all pending output is committed before close.
+        match self.stream.blocking_flush() {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, format!("{e:?}")))),
+        }
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    set_nonblocking(FD_STDIN)?;
-    set_nonblocking(FD_STDOUT)?;
+fn log_stderr(msg: &str) {
+    let stream = stderr::get_stderr();
+    let _ = stream.blocking_write_and_flush(msg.as_bytes());
+    let _ = stream.blocking_write_and_flush(b"\n");
+}
 
-    let stdin = BufReader::new(NonBlockingStdin::new());
-    let stdout = BufWriter::new(NonBlockingStdout::new());
+fn main() -> Result<(), Box<dyn std::error::Error>> {
 
-    // use the same capnp RPC setup as before but using stdin/stdout as the transport:
+
+    // Get wasi:cli stdin/stdout as streams.
+    let stdin_stream = stdin::get_stdin();
+    let stdout_stream = stdout::get_stdout();
+
+    let stdin = Wasip2Stdin::new(stdin_stream);
+    let stdout = Wasip2Stdout::new(stdout_stream);
+
+    // Cap’n Proto two-party over these streams.
     let network = twoparty::VatNetwork::new(
         stdin,
         stdout,
@@ -247,20 +121,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let echoer_provider: echo_capnp::echoer_provider::Client =
         rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
 
-    tokio::task::spawn_local(rpc_system);
+    // Drive everything on a single-threaded local pool, polling the rpc_system concurrently
+    // with our request logic to ensure responses are processed.
+    let mut pool = LocalPool::new();
 
-    {
-        let echoer_request = echoer_provider.echoer_request();
-        let resp = echoer_request.send().promise.await?;
+    let request_logic = async move {
+    log_stderr("guest: requesting echoer");
+        let resp = echoer_provider.echoer_request().send().promise.await?;
         let echoer = resp.get()?.get_echoer()?;
-        {
+    log_stderr("guest: got echoer");
+
+        for i in 0..5 {
             let mut echo_request = echoer.echo_request();
-            echo_request.get().set_msg("Hello from WASI!");
-            let echo_response = echo_request.send().promise.await?;
+            let msg: &str = "Hello from WASI!";
+            let mut buf = echo_request.get().init_msg(msg.len() as u32);
+            buf.push_str(msg);
+
+            log_stderr(&format!("guest: sending echo {}", i));
+            let echo_promise = echo_request.send().promise;
+            // await response; rpc system continues to be polled concurrently
+            let echo_response = echo_promise.await?;
             let reply = echo_response.get()?.get_reply()?;
-            println!("Received reply: {}", std::str::from_utf8(reply)?);
+            let reply_str = std::str::from_utf8(reply)?;
+            log_stderr(&format!("guest: got reply {}: {}", i, reply_str));
         }
-    }
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+
+    pool.run_until(async move {
+        let rpc_fut = async move {
+            if let Err(e) = rpc_system.await {
+                log_stderr(&format!("rpc_system error: {e:?}"));
+            }
+        };
+
+        pin_mut!(request_logic);
+        pin_mut!(rpc_fut);
+
+        match select(request_logic, rpc_fut).await {
+            Either::Left((Ok(()), _rpc_remaining)) => Ok::<(), Box<dyn std::error::Error>>(()),
+            Either::Left((Err(e), _)) => Err::<(), Box<dyn std::error::Error>>(e),
+            Either::Right((_rpc_done, _req_remaining)) => {
+                // RPC system ended before our work; treat as error
+                Err::<(), Box<dyn std::error::Error>>("rpc_system terminated early".into())
+            }
+        }
+    })?;
 
     Ok(())
 }
