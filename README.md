@@ -1,6 +1,10 @@
 # WASM and Cap'n Proto integration in Rust
 
-Proof of concept that sets up a WASM runtime in a Linux/MacOS host
+Run Cap'n Proto clients and servers within WASM programs, directly over stdin and stdout.
+
+## Proof of Concept
+
+This project sets up a WASM runtime in a Linux/MacOS host
 and provides Cap'n Proto capabilities to guest WASM processes through
 their stdin/stout by:
 
