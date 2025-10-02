@@ -172,7 +172,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Wasm guest exited cleanly");
     };
 
-    // Ensure the provider thread terminates cleanly after the guest exits.
+    // Proactively drop the Wasm instance and store to close WASI stdio resources
+    // (guest_r_async/guest_w_async). This signals EOF to the provider's transport
+    // so its RpcSystem can shut down cleanly.
+    info!("Shutting down WASM store and closing guest stdio");
+    // Dropping the store will close WASI resources (guest stdio), allowing the
+    // provider's transport to observe EOF and exit.
+    drop(store);
+
+    // Ensure the provider thread terminates cleanly after the guest exits and
+    // its stdio has been closed.
     info!("Wasm guest finished; joining provider thread");
     let _ = provider_handle.join();
 

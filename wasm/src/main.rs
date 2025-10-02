@@ -4,6 +4,7 @@ use std::task::{Context, Poll};
 
 use futures::executor::LocalPool;
 use futures::{pin_mut, future::{select, Either}};
+use futures::stream::{FuturesUnordered, StreamExt};
 
 use wasip2::cli::{stdin, stdout, stderr};
 use wasip2::io::streams;
@@ -131,19 +132,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let echoer = resp.get()?.get_echoer()?;
     log_stderr("guest: got echoer");
 
-        for i in 0..5 {
-            let mut echo_request = echoer.echo_request();
-            let msg: &str = "Hello from WASI!";
-            let mut buf = echo_request.get().init_msg(msg.len() as u32);
-            buf.push_str(msg);
+        // Fire off multiple echo requests concurrently, deliberately shuffling the
+        // start order and adding tiny cooperative delays to avoid in-order completions.
+        // A fixed permutation is fine for our purposes.
+        let order: [usize; 5] = [3, 1, 4, 0, 2];
+        let mut tasks: FuturesUnordered<_> = order
+            .into_iter()
+            .map(|i| {
+                let echoer = echoer.clone();
+                async move {
+                    let mut echo_request = echoer.echo_request();
+                    let msg = format!("Hello from WASI! #{}", i);
+                    let mut buf = echo_request.get().init_msg(msg.len() as u32);
+                    buf.push_str(&msg);
 
-            log_stderr(&format!("guest: sending echo {}", i));
-            let echo_promise = echo_request.send().promise;
-            // await response; rpc system continues to be polled concurrently
-            let echo_response = echo_promise.await?;
-            let reply = echo_response.get()?.get_reply()?;
-            let reply_str = std::str::from_utf8(reply)?;
-            log_stderr(&format!("guest: got reply {}: {}", i, reply_str));
+                    log_stderr(&format!("guest: sending echo {}", i));
+                    let echo_promise = echo_request.send().promise;
+                    let echo_response = echo_promise.await?;
+                    let reply = echo_response.get()?.get_reply()?;
+                    let reply_str = std::str::from_utf8(reply)?.to_string();
+                    Ok::<(usize, String), Box<dyn std::error::Error>>((i, reply_str))
+                }
+            })
+            .collect();
+
+        while let Some(res) = tasks.next().await {
+            match res {
+                Ok((i, reply)) => log_stderr(&format!("guest: out-of-order reply {}: {}", i, reply)),
+                Err(e) => log_stderr(&format!("guest: echo task error: {e}")),
+            }
         }
 
         Ok::<(), Box<dyn std::error::Error>>(())
