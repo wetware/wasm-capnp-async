@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 
 use futures::executor::LocalPool;
 use futures::{pin_mut, future::{select, Either}};
-use futures::stream::{FuturesUnordered, StreamExt};
+// (no stream utilities needed)
 
 use wasip2::cli::{stdin, stdout, stderr};
 use wasip2::io::streams;
@@ -101,13 +101,9 @@ fn log_stderr(msg: &str) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 
-
-    // Get wasi:cli stdin/stdout as streams.
-    let stdin_stream = stdin::get_stdin();
-    let stdout_stream = stdout::get_stdout();
-
-    let stdin = Wasip2Stdin::new(stdin_stream);
-    let stdout = Wasip2Stdout::new(stdout_stream);
+    // Get wasi:cli stdin/stdout as WASIp2 streams.
+    let stdin = Wasip2Stdin::new(stdin::get_stdin());
+    let stdout = Wasip2Stdout::new(stdout::get_stdout());
 
     // Cap’n Proto two-party over these streams.
     let network = twoparty::VatNetwork::new(
@@ -132,36 +128,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let echoer = resp.get()?.get_echoer()?;
     log_stderr("guest: got echoer");
 
-        // Fire off multiple echo requests concurrently, deliberately shuffling the
-        // start order and adding tiny cooperative delays to avoid in-order completions.
-        // A fixed permutation is fine for our purposes.
-        let order: [usize; 5] = [3, 1, 4, 0, 2];
-        let mut tasks: FuturesUnordered<_> = order
-            .into_iter()
-            .map(|i| {
-                let echoer = echoer.clone();
-                async move {
-                    let mut echo_request = echoer.echo_request();
-                    let msg = format!("Hello from WASI! #{}", i);
-                    let mut buf = echo_request.get().init_msg(msg.len() as u32);
-                    buf.push_str(&msg);
+        // Submit echo requests in order, store their promises by index.
+        let count = 5usize;
+        let mut promises: Vec<Option<_>> = Vec::with_capacity(count);
+        let mut expected: Vec<String> = Vec::with_capacity(count);
 
-                    log_stderr(&format!("guest: sending echo {}", i));
-                    let echo_promise = echo_request.send().promise;
-                    let echo_response = echo_promise.await?;
-                    let reply = echo_response.get()?.get_reply()?;
-                    let reply_str = std::str::from_utf8(reply)?.to_string();
-                    Ok::<(usize, String), Box<dyn std::error::Error>>((i, reply_str))
-                }
-            })
-            .collect();
-
-        while let Some(res) = tasks.next().await {
-            match res {
-                Ok((i, reply)) => log_stderr(&format!("guest: out-of-order reply {}: {}", i, reply)),
-                Err(e) => log_stderr(&format!("guest: echo task error: {e}")),
-            }
+        for i in 0..count {
+            let mut echo_request = echoer.echo_request();
+            let msg = format!("Hello from WASI! #{}", i);
+            let mut buf = echo_request.get().init_msg(msg.len() as u32);
+            buf.push_str(&msg);
+            log_stderr(&format!("guest: submitting echo {}", i));
+            let promise = echo_request.send().promise;
+            promises.push(Some(promise));
+            expected.push(msg);
         }
+
+        // Re-order the (index, promise) groups and then read results in that different order.
+        let order: [usize; 5] = [3, 1, 4, 0, 2];
+        for idx in order {
+            let promise = promises[idx]
+                .take()
+                .expect("promise should be present");
+            let echo_response = promise.await?;
+            let reply = echo_response.get()?.get_reply()?;
+            let reply_str = std::str::from_utf8(reply)?.to_string();
+            log_stderr(&format!("guest: read echo {} => {}", idx, reply_str));
+            assert_eq!(reply_str, expected[idx], "reply mismatch for index {}", idx);
+        }
+
+        log_stderr("guest: all shuffled assertions passed");
 
         Ok::<(), Box<dyn std::error::Error>>(())
     };
