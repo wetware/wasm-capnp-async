@@ -21,6 +21,10 @@ clean-guest:
 run:
 	cargo run
 
+# Depends [flamegraph](https://github.com/flamegraph-rs/flamegraph#systems-performance-work-guided-by-flamegraphs).
+profile:
+	CARGO_PROFILE_RELEASE_DEBUG=true RUST_LOG=warn RUSTFLAGS="-C force-frame-pointers=yes" cargo flamegraph
+
 # There must be a way cleaner way of configuring the logger but my hacking
 # session has resulted in me running adding this mumbo jumbo to my run command.
 trace:
