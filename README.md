@@ -1,4 +1,4 @@
-# WASM and Cap'n Proto integration in Rust
+# Wasm and Cap'n Proto integration in Rust
 
 Run Cap'n Proto clients and servers within WASM programs, directly over stdin and stdout.
 
