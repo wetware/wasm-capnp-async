@@ -1,20 +1,17 @@
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
+use futures::executor::LocalPool;
+use futures::{pin_mut, future::{select, Either}, stream::{FuturesUnordered, StreamExt}};
 use std::io;
 use std::task::{Context, Poll};
-
-use futures::executor::LocalPool;
-use futures::{pin_mut, future::{select, Either}};
-// (no stream utilities needed)
-
 use wasip2::cli::{stdin, stdout, stderr};
 use wasip2::io::streams;
+use wasip2::random::random as wasi_random;
 
-// Keep the generated Cap’n Proto bindings.
 capnp::generated_code!(pub mod echo_capnp);
 
-// Simple adapters over wasi:io/streams. We implement non-blocking reads (return
-// Pending when no bytes are ready) and flush-safe writes so Cap'n Proto frames
-// aren't truncated.
+// Trying to use Cap'n Proto over the raw wasi:io/streams will not deadlock at some
+// point and will not work. We need to implement non-blocking reads (return Pending
+// when no bytes are ready) and flush-safe writes streams so capnp frames aren't truncated.
 
 struct Wasip2Stdin {
     stream: streams::InputStream,
@@ -99,6 +96,59 @@ fn log_stderr(msg: &str) {
     let _ = stream.blocking_write_and_flush(b"\n");
 }
 
+/// Submit `count` echo requests in order, then consume replies in a randomized order.
+/// If `seed` is provided, the shuffle is reproducible; otherwise a WASI random seed is used.
+async fn run_echo_batch(
+    echoer: echo_capnp::echoer::Client,
+    count: usize,
+    seed: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Submit echo requests in order, store their promises by index.
+    let mut promises: Vec<Option<_>> = Vec::with_capacity(count);
+    let mut expected: Vec<String> = Vec::with_capacity(count);
+
+    for i in 0..count {
+        let mut echo_request = echoer.echo_request();
+        let msg = format!("Hello from WASI! #{}", i);
+        let mut buf = echo_request.get().init_msg(msg.len() as u32);
+        buf.push_str(&msg);
+        log_stderr(&format!("guest: submitting echo {}", i));
+        let promise = echo_request.send().promise;
+        promises.push(Some(promise));
+        expected.push(msg);
+    }
+
+    // Randomize the read order and then consume results accordingly.
+    let s = seed.unwrap_or_else(seed_from_wasi);
+    let order = shuffle_indices(count, s);
+
+    for idx in order {
+        let promise = promises[idx]
+            .take()
+            .expect("promise should be present");
+        let echo_response = promise.await?;
+        let reply = echo_response.get()?.get_reply()?;
+        let reply_str = std::str::from_utf8(reply)?.to_string();
+        log_stderr(&format!("guest: read echo {} => {}", idx, reply_str));
+        assert_eq!(reply_str, expected[idx], "reply mismatch for index {}", idx);
+    }
+
+    log_stderr("guest: batch assertions passed");
+    Ok(())
+}
+
+
+/// The main function will bootstrap `EchoerProvider` over stdin/stdout,
+/// then spawn ${batch_count} tasks. Each task will perform a call to `EchoerProvider.echoer()`,
+/// obtain an `Echoer` capability, then call `Echoer.echo("<message>"), wait for the response,
+/// and assert the response matches the input. Each task will do this with different messages
+/// ${call_count} amount of times.
+/// 
+/// The main idea is to force a high degree of concurrency and interleaving of requests and responses,
+/// putting a lot of concurrent read/write pressure on the Cap'n Proto transport.
+/// Execution will finish when all tasks complete successfully, or if any task fails.
+/// Execution blocking would indicate a deadlock in the transport layer,
+/// which means there is an issue in the implementation.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get wasi:cli stdin/stdout as WASIp2 streams.
@@ -128,36 +178,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let echoer = resp.get()?.get_echoer()?;
     log_stderr("guest: got echoer");
 
-        // Submit echo requests in order, store their promises by index.
-        let count = 5usize;
-        let mut promises: Vec<Option<_>> = Vec::with_capacity(count);
-        let mut expected: Vec<String> = Vec::with_capacity(count);
+    // Configurable number of tasks per batch and number of batches to stress concurrency.
+    let call_count: usize = 1000;
+    let batch_count: usize = 10;
+    // Optional fixed seed to make shuffles reproducible across runs; set Some(value) to fix.
+    let fixed_seed: Option<u64> = None;
 
-        for i in 0..count {
-            let mut echo_request = echoer.echo_request();
-            let msg = format!("Hello from WASI! #{}", i);
-            let mut buf = echo_request.get().init_msg(msg.len() as u32);
-            buf.push_str(&msg);
-            log_stderr(&format!("guest: submitting echo {}", i));
-            let promise = echo_request.send().promise;
-            promises.push(Some(promise));
-            expected.push(msg);
+        // Launch all batches at once and await them asynchronously as they finish.
+        let mut futs: FuturesUnordered<_> = (0..batch_count)
+            .map(|b| {
+                let e = echoer.clone();
+                // Derive a per-batch seed if a fixed seed was provided; otherwise None -> WASI seed.
+                let batch_seed = fixed_seed.map(|s| s ^ (b as u64).wrapping_mul(0x9E3779B97F4A7C15));
+                async move {
+                    log_stderr(&format!("guest: starting batch {} ({} tasks)", b, call_count));
+                    let res = run_echo_batch(e, call_count, batch_seed).await;
+                    (b, res)
+                }
+            })
+            .collect();
+
+        while let Some((i, r)) = futs.next().await {
+            match r {
+                Ok(()) => log_stderr(&format!("guest: batch {} completed", i)),
+                Err(e) => {
+                    log_stderr(&format!("guest: batch {} failed: {e}", i));
+                    return Err(e);
+                }
+            }
         }
 
-        // Re-order the (index, promise) groups and then read results in that different order.
-        let order: [usize; 5] = [3, 1, 4, 0, 2];
-        for idx in order {
-            let promise = promises[idx]
-                .take()
-                .expect("promise should be present");
-            let echo_response = promise.await?;
-            let reply = echo_response.get()?.get_reply()?;
-            let reply_str = std::str::from_utf8(reply)?.to_string();
-            log_stderr(&format!("guest: read echo {} => {}", idx, reply_str));
-            assert_eq!(reply_str, expected[idx], "reply mismatch for index {}", idx);
-        }
-
-        log_stderr("guest: all shuffled assertions passed");
+        log_stderr("guest: all batches completed successfully");
 
         Ok::<(), Box<dyn std::error::Error>>(())
     };
@@ -183,4 +234,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     Ok(())
+}
+
+
+// I had some LLM generate the suffle functions, just know it works and it was not written
+// by a human.
+
+// Seed helpers and a tiny LCG for deterministic shuffles when desired.
+fn seed_from_wasi() -> u64 {
+    let bytes = wasi_random::get_random_bytes(8);
+    if bytes.len() == 8 {
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&bytes);
+        u64::from_le_bytes(arr)
+    } else {
+        0x9E3779B97F4A7C15u64 // fallback constant
+    }
+}
+
+// Advance a 64-bit Linear Congruential Generator state and return the new value.
+#[inline]
+fn lcg_next(state: &mut u64) -> u64 {
+    // Numerical Recipes LCG constants; sufficient for simple shuffle here.
+    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+    *state
+}
+
+// Produce a shuffled vector of indices [0, len) using Fisher-Yates with an LCG RNG.
+fn shuffle_indices(len: usize, seed: u64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..len).collect();
+    if len <= 1 { return order; }
+    let mut s = if seed == 0 { 1 } else { seed };
+    for i in (1..len).rev() {
+        let r = (lcg_next(&mut s) as usize) % (i + 1);
+        order.swap(i, r);
+    }
+    order
 }
