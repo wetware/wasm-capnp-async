@@ -1,4 +1,4 @@
-.PHONY: clean run
+.PHONY: clean run trace
 
 all: clean build
 
