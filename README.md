@@ -19,8 +19,9 @@ The WASM guest will:
 This will return a new `Echoer` capability.
 3. Call the `echo` method of the newly obtained `Echoer` and verify the result: `Echoer.echo("<some message>")`.
 
-Steps 2 and 3 will be done several times concurrently, producing multiple (different) `Echoer` objects
-and verifying that the transport is capable of handling multiple concurrent read/write requests.
+Steps 2 and 3 are performed many times concurrently, producing multiple (different) `Echoer` objects
+and verifying that the transport is capable of handling multiple concurrent read/write requests
+under pressure.
 
 ## Usage
 
