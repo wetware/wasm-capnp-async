@@ -19,7 +19,6 @@ pub struct ComponentRunStates {
     // impl of WasiView is required by [`wasmtime_wasi::p2::add_to_linker_sync`]
     pub wasi_ctx: WasiCtx,
     pub resource_table: ResourceTable,
-    // You can add other custom host states if needed
 }
 
 impl WasiView for ComponentRunStates {
@@ -31,6 +30,13 @@ impl WasiView for ComponentRunStates {
     }
 }
 
+/// The main function will:
+/// 1. Set up async pipes, map them to the guest stdin/stdout
+/// 2. Map the guest stderr to host tracing
+/// 3. Spawn the Cap'n Proto provider on a dedicated thread
+/// 4. Bootstrap the capability over the async pipes
+/// 5. Spawn the guest process
+/// 6. Wait for the guest to exit
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize global tracing subscriber before any Wasmer/Cap'n Proto activity.
@@ -38,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Use RUST_LOG if set; otherwise default to info with useful module hints.
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new(
-                "info,wasmer=info,wasmer_wasix=info,capnp_rpc=info,wasm_capnp_async=info",
+                "info,wasmtime=info,wasmtime_wasi=info,capnp_rpc=info,wasm_capnp_async=info",
             )
         });
         tracing_subscriber::fmt()
@@ -93,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn the Cap'n Proto provider on a dedicated background thread with its own
     // single-threaded Tokio runtime. This keeps the RPC system on one thread,
     // while the Wasm module runs on the main thread.
-    info!("spawning RPC provider thread");
+    info!("Spawning RPC provider thread");
     let provider_handle = thread::Builder::new()
         .name("rpc-provider".to_string())
         .spawn(move || {
