@@ -7,6 +7,7 @@ use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::*;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi::cli::{AsyncStdinStream, AsyncStdoutStream};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use cap::{self, echo_capnp::echoer_provider};
 use tracing::{debug, info, warn};
@@ -60,6 +61,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wrap guest-side ends in WASI-compatible async stdio streams.
     let guest_r_async = AsyncStdinStream::new(guest_r);
     let guest_w_async = AsyncStdoutStream::new(64 * 1024 * 1024, guest_w);
+
+    // Separate stderr so we can capture and map it to host tracing.
+    let (guest_stderr_host_r, guest_stderr_guest_w): (DuplexStream, DuplexStream) =
+        tokio::io::duplex(4 * 1024 * 1024);
+    let guest_e_async = AsyncStdoutStream::new(64 * 1024 * 1024, guest_stderr_guest_w);
+
+    // Spawn a task to read guest stderr lines and log them via tracing at info level.
+    let mut stderr_reader = BufReader::new(guest_stderr_host_r);
+    let stderr_task = tokio::spawn(async move {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stderr_reader.read_line(&mut line).await {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    let msg = line.trim_end_matches(['\n', '\r']);
+                    info!(target: "guest", "{}", msg);
+                }
+                Err(e) => {
+                    warn!(error = %e, target = "guest", "error reading guest stderr");
+                    break;
+                }
+            }
+        }
+    });
 
     // Create a readiness channel so the main thread waits until the provider is listening.
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -137,7 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wasi = WasiCtx::builder()
         .stdin(guest_r_async)
         .stdout(guest_w_async)
-        .inherit_stderr()
+        .stderr(guest_e_async)
         .inherit_args()
         .build();
     let state = ComponentRunStates {
@@ -184,6 +210,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // its stdio has been closed.
     info!("Wasm guest finished; joining provider thread");
     let _ = provider_handle.join();
+
+    // Ensure the stderr mapping task has finished.
+    let _ = stderr_task.await;
 
     info!("Ok");
     Ok(())
