@@ -2,16 +2,18 @@ use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use std::fs;
 use std::thread;
 use tokio::io::DuplexStream;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::*;
-use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi::cli::{AsyncStdinStream, AsyncStdoutStream};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 use cap::{self, echo_capnp::echoer_provider};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
+
+const BUFFER_SIZE: usize = 32 * 1024 * 1024;
 
 pub struct ComponentRunStates {
     // These two are required basically as a standard way to enable the impl of IoView and
@@ -61,17 +63,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create pipes for WASI stdio and host/provider RPC network.
     // Use larger pipe buffers to reduce backpressure interactions between read/write sides.
-    let (host_w, guest_r): (DuplexStream, DuplexStream) = tokio::io::duplex(64 * 1024 * 1024);
-    let (host_r, guest_w): (DuplexStream, DuplexStream) = tokio::io::duplex(64 * 1024 * 1024);
+    let (host_w, guest_r): (DuplexStream, DuplexStream) = tokio::io::duplex(BUFFER_SIZE);
+    let (host_r, guest_w): (DuplexStream, DuplexStream) = tokio::io::duplex(BUFFER_SIZE);
 
     // Wrap guest-side ends in WASI-compatible async stdio streams.
     let guest_r_async = AsyncStdinStream::new(guest_r);
-    let guest_w_async = AsyncStdoutStream::new(64 * 1024 * 1024, guest_w);
+    let guest_w_async = AsyncStdoutStream::new(BUFFER_SIZE, guest_w);
 
     // Separate stderr so we can capture and map it to host tracing.
     let (guest_stderr_host_r, guest_stderr_guest_w): (DuplexStream, DuplexStream) =
-        tokio::io::duplex(4 * 1024 * 1024);
-    let guest_e_async = AsyncStdoutStream::new(64 * 1024 * 1024, guest_stderr_guest_w);
+        tokio::io::duplex(BUFFER_SIZE);
+    let guest_e_async = AsyncStdoutStream::new(BUFFER_SIZE, guest_stderr_guest_w);
 
     // Spawn a task to read guest stderr lines and log them via tracing at info level.
     let mut stderr_reader = BufReader::new(guest_stderr_host_r);
