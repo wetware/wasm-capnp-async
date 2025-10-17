@@ -10,8 +10,6 @@ exclude = [ "wasm" ]
 [dependencies]
 cap = { path = "lib/cap" }
 capnp = "0.21.5"
-wasmer-wasi = "3.1.1"
-wasmer-wasix = "0.600.1"
 socket2 = { version = "0.5.3", features = [ "all" ] }
 capnp-rpc = "0.21.0"
 tokio = { version = "1.47.1", features = ["full"] }
